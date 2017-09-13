@@ -1,1 +1,1 @@
-# ImageRecognitionRBM
+# MultiLayerBoltzmannMachine
