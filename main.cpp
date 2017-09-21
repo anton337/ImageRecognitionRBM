@@ -2,6 +2,7 @@
 #include "readBMP.h"
 #include <math.h>
 #include <stdlib.h>
+#include <boost/date_time/posix_time/posix_time.hpp>
 #include <boost/thread.hpp>
 #include <GL/glut.h>
 #include <fftw3.h>
@@ -28,16 +29,17 @@
 
 long n_samples = 0;
 long n_batch = 0;
-long batch_iter = 20;
+long batch_iter = 200;
 long n_variables = 0;
 long n_cd = 1;
-float epsilon = 0.001;
+float c_epsilon = 0.001;
 
 std::vector<float> errs;
 
 long WIN=32;
 
 float * img_arr = NULL;
+float * out_arr = NULL;
 float * orig_arr = NULL;
 
 float * vis_preview = new float[WIN*WIN];
@@ -49,6 +51,119 @@ float * vis1_previewG = new float[WIN*WIN];
 float * vis_previewB = new float[WIN*WIN];
 float * vis0_previewB = new float[WIN*WIN];
 float * vis1_previewB = new float[WIN*WIN];
+
+void clear() {
+  // CSI[2J clears screen, CSI[H moves the cursor to top-left corner
+  std::cout << "\x1B[2J\x1B[H";
+}
+
+float norm(float * dat,long size)
+{
+  float ret = 0;
+  for(long i=0;i<size;i++)
+  {
+    ret += dat[i]*dat[i];
+  }
+  return sqrt(ret);
+}
+
+void zero(float * dat,long size)
+{
+  for(long i=0;i<size;i++)
+  {
+    dat[i] = 0;
+  }
+}
+
+void constant(float * dat,float val,long size)
+{
+  for(long i=0;i<size;i++)
+  {
+    dat[i] = (-1+2*((rand()%10000)/10000.0f))*val;
+  }
+}
+
+void add(float * A, float * dA, float epsilon, long size)
+{
+  for(long i=0;i<size;i++)
+  {
+    A[i] += epsilon * dA[i];
+  }
+}
+
+struct gradient_info
+{
+  long n;
+  long v;
+  long h;
+  float * vis0;
+  float * hid0;
+  float * vis;
+  float * hid;
+  float * dW;
+  float * dc;
+  float * db;
+  float partial_err;
+  float * partial_dW;
+  float * partial_dc;
+  float * partial_db;
+  void init()
+  {
+    partial_err = 0;
+    partial_dW = new float[h*v];
+    for(int i=0;i<h*v;i++)partial_dW[i]=0;
+    partial_dc = new float[h];
+    for(int i=0;i<h;i++)partial_dc[i]=0;
+    partial_db = new float[v];
+    for(int i=0;i<v;i++)partial_db[i]=0;
+  }
+  void destroy()
+  {
+    delete [] partial_dW;
+    delete [] partial_dc;
+    delete [] partial_db;
+  }
+  void globalUpdate()
+  {
+    for(int i=0;i<h*v;i++)
+        dW[i] += partial_dW[i];
+    for(int i=0;i<h;i++)
+        dc[i] += partial_dc[i];
+    for(int i=0;i<v;i++)
+        db[i] += partial_db[i];
+  }
+};
+
+void gradient_worker(gradient_info * g,std::vector<long> const & vrtx)
+{
+  float factor = 1.0f / g->n;
+  for(long t=0;t<vrtx.size();t++)
+  {
+    long k = vrtx[t];
+    for(long i=0;i<g->v;i++)
+    {
+      for(long j=0;j<g->h;j++)
+      {
+        g->partial_dW[i*g->h+j] -= factor * (g->vis0[k*g->v+i]*g->hid0[k*g->h+j] - g->vis[k*g->v+i]*g->hid[k*g->h+j]);
+      }
+    }
+
+    for(long j=0;j<g->h;j++)
+    {
+      g->partial_dc[j] -= factor * (g->hid0[k*g->h+j]*g->hid0[k*g->h+j] - g->hid[k*g->h+j]*g->hid[k*g->h+j]);
+    }
+
+    for(long i=0;i<g->v;i++)
+    {
+      g->partial_db[i] -= factor * (g->vis0[k*g->v+i]*g->vis0[k*g->v+i] - g->vis[k*g->v+i]*g->vis[k*g->v+i]);
+    }
+
+    for(long i=0;i<g->v;i++)
+    {
+      g->partial_err += (g->vis0[k*g->v+i]-g->vis[k*g->v+i])*(g->vis0[k*g->v+i]-g->vis[k*g->v+i]);
+    }
+  }
+}
 
 void vis2hid_worker(const float * X,float * H,long h,long v,float * c,float * W,std::vector<long> const & vrtx)
 {
@@ -95,7 +210,16 @@ struct RBM
   float * b; // bias term for visible state, R^v
   float * W; // weight matrix R^h*v
   float * X; // input data, binary [0,1], v*n
-  RBM(long _h,long _v,float * _W,float * _b,float * _c,long _n,float * _X)
+
+  float * vis0;
+  float * hid0;
+  float * vis;
+  float * hid;
+  float * dW;
+  float * dc;
+  float * db;
+
+  RBM(long _v,long _h,float * _W,float * _b,float * _c,long _n,float * _X)
   {
     for(long k=0;k<100;k++)
       std::cout << _X[k] << "\t";
@@ -107,8 +231,16 @@ struct RBM
     c = _c;
     b = _b;
     W = _W;
+
+    vis0 = NULL;
+    hid0 = NULL;
+    vis = NULL;
+    hid = NULL;
+    dW = NULL;
+    dc = NULL;
+    db = NULL;
   }
-  RBM(long _h,long _v,long _n,float* _X)
+  RBM(long _v,long _h,long _n,float* _X)
   {
     for(long k=0;k<100;k++)
       std::cout << _X[k] << "\t";
@@ -123,45 +255,43 @@ struct RBM
     constant(c,0.5f,h);
     constant(b,0.5f,v);
     constant(W,0.5f,v*h);
+
+    vis0 = NULL;
+    hid0 = NULL;
+    vis = NULL;
+    hid = NULL;
+    dW = NULL;
+    dc = NULL;
+    db = NULL;
   }
 
-  float norm(float * dat,long size)
+  void init(int offset)
   {
-    float ret = 0;
-    for(long i=0;i<size;i++)
-    {
-      ret += dat[i]*dat[i];
-    }
-    return sqrt(ret);
-  }
+    boost::posix_time::ptime time_start(boost::posix_time::microsec_clock::local_time());
+    if(vis0==NULL)vis0 = new float[n*v];
+    if(hid0==NULL)hid0 = new float[n*h];
+    if(vis==NULL)vis = new float[n*v];
+    if(hid==NULL)hid = new float[n*h];
+    if(dW==NULL)dW = new float[h*v];
+    if(dc==NULL)dc = new float[h];
+    if(db==NULL)db = new float[v];
 
-  void zero(float * dat,long size)
-  {
-    for(long i=0;i<size;i++)
+    std::cout << "n*v=" << n*v << std::endl;
+    std::cout << "offset=" << offset << std::endl;
+    for(long i=0,size=n*v;i<size;i++)
     {
-      dat[i] = 0;
+      vis0[i] = X[i+offset];
     }
-  }
 
-  void constant(float * dat,float val,long size)
-  {
-    for(long i=0;i<size;i++)
-    {
-      dat[i] = (-1+2*((rand()%10000)/10000.0f))*val;
-    }
-  }
-
-  void add(float * A, float * dA, float epsilon, long size)
-  {
-    for(long i=0;i<size;i++)
-    {
-      A[i] += epsilon * dA[i];
-    }
+    vis2hid(vis0,hid0);
+    boost::posix_time::ptime time_end(boost::posix_time::microsec_clock::local_time());
+    boost::posix_time::time_duration duration(time_end - time_start);
+    std::cout << "init timing:" << duration << '\n';
   }
 
   void cd(long nGS,float epsilon,int offset=0)
   {
-
+    boost::posix_time::ptime time_0(boost::posix_time::microsec_clock::local_time());
     std::cout << "cd" << std::endl;
 
     // CD Contrastive divergence (Hlongon's CD(k))
@@ -169,95 +299,14 @@ struct RBM
     //   the weihgts, visible and hidden biases using Hlongon's
     //   approximated CD. The sum of the average hidden units
     //   activity is returned in act as well.
-   
-    float * vis0 = new float[n*v];
-    float * hid0 = new float[n*h];
-    float * vis = new float[n*v];
-    float * hid = new float[n*h];
-    float * dW = new float[h*v];
-    float * dc = new float[h];
-    float * db = new float[v];
-
-    for(long i=0,size=n*v;i<size;i++)
-    {
-      vis0[i] = X[i+offset];
-    }
-    /*
-    float S;
-    long N = 1;
-    for(long k=0;k<n;k++)
-    {
-      float max_S = 1e-5;
-      for(long y=0,i=0;y<WIN;y++)
-      {
-        for(long x=0;x<WIN;x++,i++)
-        {
-          if(i+N<WIN*WIN && x+N<WIN)
-          {
-            S = (pow(
-                  vis0[2*WIN*WIN*k+i]
-                 +vis0[2*WIN*WIN*k+i+1]
-                 ,2))/((N+1)*(
-                  pow(vis0[2*WIN*WIN*k+i],2)
-                 +pow(vis0[2*WIN*WIN*k+i+1],2)
-                  )+1e-5);
-          }
-          else
-          {
-            S = 1.0f;
-          }
-          //S *= S;
-          //S *= S;
-          vis0[2*WIN*WIN*k+i] = 1.0f - S;
-          vis0[2*WIN*WIN*k+i] = 1.0f - S;
-          vis0[2*WIN*WIN*k+i] = 1.0f - S;
-          if(vis0[2*WIN*WIN*k+i]<0)vis0[2*WIN*WIN*k+i]=0;
-          if(vis0[2*WIN*WIN*k+i]>1)vis0[2*WIN*WIN*k+i]=1;
-          //vis0[2*WIN*WIN*k+i] = vis0[2*WIN*WIN*k+i]>0.5f;
-          if(vis0[2*WIN*WIN*k+i]>max_S)max_S=vis0[2*WIN*WIN*k+i];
-        }
-      }
-      for(long y=0,i=0;y<WIN;y++)
-      {
-        for(long x=0;x<WIN;x++,i++)
-        {
-          vis0[2*WIN*WIN*k+i] /= max_S;
-          if(vis0[2*WIN*WIN*k+i]>1)vis0[2*WIN*WIN*k+i]=1;
-        }
-      }
-    }
-    */
-
-    //for(long k=0;k<n;k++)
-    //{
-    //  float max_S = 1e-5;
-    //  float min_S = 1;
-    //  for(long y=0,i=0;y<WIN;y++)
-    //  {
-    //    for(long x=0;x<WIN;x++,i++)
-    //    {
-    //      if(vis0[2*WIN*WIN*k+i]>max_S)max_S=vis0[2*WIN*WIN*k+i];
-    //      if(vis0[2*WIN*WIN*k+i]<min_S)min_S=vis0[2*WIN*WIN*k+i];
-    //    }
-    //  }
-    //  for(long y=0,i=0;y<WIN;y++)
-    //  {
-    //    for(long x=0;x<WIN;x++,i++)
-    //    {
-    //      vis0[2*WIN*WIN*k+i] = (vis0[2*WIN*WIN*k+i]-min_S)/(max_S-min_S);
-    //      if(vis0[2*WIN*WIN*k+i]<0)vis0[2*WIN*WIN*k+i]=0;
-    //      if(vis0[2*WIN*WIN*k+i]>1)vis0[2*WIN*WIN*k+i]=1;
-    //      vis0[2*WIN*WIN*k+i] -= 0.5f;
-    //    }
-    //  }
-    //}
-
-    vis2hid(vis0,hid0);
 
     for(long i=0;i<n*h;i++)
     {
       hid[i] = hid0[i];
     }
+    boost::posix_time::ptime time_1(boost::posix_time::microsec_clock::local_time());
+    boost::posix_time::time_duration duration10(time_1 - time_0);
+    std::cout << "cd timing 1:" << duration10 << '\n';
 
     for (long iter = 1;iter<=nGS;iter++)
     {
@@ -298,40 +347,29 @@ struct RBM
       }
 
     }
+    boost::posix_time::ptime time_2(boost::posix_time::microsec_clock::local_time());
+    boost::posix_time::time_duration duration21(time_2 - time_1);
+    std::cout << "cd timing 2:" << duration21 << '\n';
   
     zero(dW,v*h);
     zero(dc,h);
     zero(db,v);
-    float err = 0;
-    for(long k=0;k<n;k++)
-    {
-      for(long i=0;i<v;i++)
-      {
-        for(long j=0;j<h;j++)
-        {
-          dW[i*h+j] -= (vis0[k*v+i]*hid0[k*h+j] - vis[k*v+i]*hid[k*h+j]) / n;
-        }
-      }
-
-      for(long j=0;j<h;j++)
-      {
-        dc[j] -= (hid0[k*h+j]*hid0[k*h+j] - hid[k*h+j]*hid[k*h+j]) / n;
-      }
-
-      for(long i=0;i<v;i++)
-      {
-        db[i] -= (vis0[k*v+i]*vis0[k*v+i] - vis[k*v+i]*vis[k*v+i]) / n;
-      }
-
-      for(long i=0;i<v;i++)
-      {
-        err += (vis0[k*v+i]-vis[k*v+i])*(vis0[k*v+i]-vis[k*v+i]);
-      }
-    }
-    err = sqrt(err);
-    for(int t=2;t<10&&t<errs.size();t++)
-      err += (errs[errs.size()+1-t]-err)/t;
-    errs.push_back(err);
+    boost::posix_time::ptime time_3(boost::posix_time::microsec_clock::local_time());
+    boost::posix_time::time_duration duration32(time_3 - time_2);
+    std::cout << "cd timing 3:" << duration32 << '\n';
+    float * err = new float(0);
+    gradient_update(n,vis0,hid0,vis,hid,dW,dc,db,err);
+    boost::posix_time::ptime time_4(boost::posix_time::microsec_clock::local_time());
+    boost::posix_time::time_duration duration43(time_4 - time_3);
+    std::cout << "cd timing 4:" << duration43 << '\n';
+    *err = sqrt(*err);
+    for(int t=2;t<3&&t<errs.size();t++)
+      *err += (errs[errs.size()+1-t]-*err)/t;
+    errs.push_back(*err);
+    boost::posix_time::ptime time_5(boost::posix_time::microsec_clock::local_time());
+    boost::posix_time::time_duration duration54(time_5 - time_4);
+    std::cout << "cd timing 5:" << duration54 << '\n';
+    std::cout << "epsilon = " << epsilon << std::endl;
     add(W,dW,-epsilon,v*h);
     add(c,dc,-epsilon,h);
     add(b,db,-epsilon,v);
@@ -339,16 +377,15 @@ struct RBM
     std::cout << "dW norm = " << norm(dW,v*h) << std::endl;
     std::cout << "dc norm = " << norm(dc,h) << std::endl;
     std::cout << "db norm = " << norm(db,v) << std::endl;
-    std::cout << "err = " << err << std::endl;
+    std::cout << "W norm = " << norm(W,v*h) << std::endl;
+    std::cout << "c norm = " << norm(c,h) << std::endl;
+    std::cout << "b norm = " << norm(b,v) << std::endl;
+    std::cout << "err = " << *err << std::endl;
+    delete err;
 
-    delete [] vis0;
-    delete [] hid0;
-    delete [] vis;
-    delete [] hid;
-    delete [] dW;
-    delete [] dc;
-    delete [] db;
-
+    boost::posix_time::ptime time_6(boost::posix_time::microsec_clock::local_time());
+    boost::posix_time::time_duration duration65(time_6 - time_5);
+    std::cout << "cd timing 6:" << duration65 << '\n';
   }
 
   void sigmoid(float * p,float * X,long n)
@@ -362,7 +399,7 @@ struct RBM
   void vis2hid(const float * X,float * H)
   {
     std::vector<boost::thread*> threads;
-    std::vector<std::vector<long> > vrtx(8);
+    std::vector<std::vector<long> > vrtx(boost::thread::hardware_concurrency());
     for(long i=0;i<n;i++)
     {
       vrtx[i%vrtx.size()].push_back(i);
@@ -376,12 +413,75 @@ struct RBM
       threads[thread]->join();
       delete threads[thread];
     }
+    threads.clear();
+    vrtx.clear();
+  }
+
+  void gradient_update(long n,float * vis0,float * hid0,float * vis,float * hid,float * dW,float * dc,float * db,float * err)
+  {
+    boost::posix_time::ptime time_0(boost::posix_time::microsec_clock::local_time());
+
+    std::vector<boost::thread*> threads;
+    std::vector<std::vector<long> > vrtx(boost::thread::hardware_concurrency());
+    std::vector<gradient_info*> g;
+
+    boost::posix_time::ptime time_1(boost::posix_time::microsec_clock::local_time());
+    boost::posix_time::time_duration duration10(time_1 - time_0);
+    std::cout << "gradient update timing 1:" << duration10 << '\n';
+
+    for(long i=0;i<n;i++)
+    {
+      vrtx[i%vrtx.size()].push_back(i);
+    }
+    boost::posix_time::ptime time_2(boost::posix_time::microsec_clock::local_time());
+    boost::posix_time::time_duration duration21(time_2 - time_1);
+    std::cout << "gradient update timing 2:" << duration21 << '\n';
+    for(long i=0;i<vrtx.size();i++)
+    {
+      g.push_back(new gradient_info());
+    }
+    boost::posix_time::ptime time_3(boost::posix_time::microsec_clock::local_time());
+    boost::posix_time::time_duration duration32(time_3 - time_2);
+    std::cout << "gradient update timing 3:" << duration32 << '\n';
+    for(long thread=0;thread<vrtx.size();thread++)
+    {
+      g[thread]->n = n;
+      g[thread]->v = v;
+      g[thread]->h = h;
+      g[thread]->vis0 = vis0;
+      g[thread]->hid0 = hid0;
+      g[thread]->vis = vis;
+      g[thread]->hid = hid;
+      g[thread]->dW = dW;
+      g[thread]->dc = dc;
+      g[thread]->db = db;
+      g[thread]->init();
+      threads.push_back(new boost::thread(gradient_worker,g[thread],vrtx[thread]));
+    }
+    boost::posix_time::ptime time_4(boost::posix_time::microsec_clock::local_time());
+    boost::posix_time::time_duration duration43(time_4 - time_3);
+    std::cout << "gradient update timing 4:" << duration43 << '\n';
+    for(long thread=0;thread<vrtx.size();thread++)
+    {
+      threads[thread]->join();
+      delete threads[thread];
+      g[thread]->globalUpdate();
+      *err += g[thread]->partial_err;
+      g[thread]->destroy();
+      delete g[thread];
+    }
+    boost::posix_time::ptime time_5(boost::posix_time::microsec_clock::local_time());
+    boost::posix_time::time_duration duration54(time_5 - time_4);
+    std::cout << "gradient update timing 5:" << duration54 << '\n';
+    threads.clear();
+    vrtx.clear();
+    g.clear();
   }
   
   void hid2vis(const float * H,float * V)
   {
     std::vector<boost::thread*> threads;
-    std::vector<std::vector<long> > vrtx(8);
+    std::vector<std::vector<long> > vrtx(boost::thread::hardware_concurrency());
     for(long i=0;i<n;i++)
     {
       vrtx[i%vrtx.size()].push_back(i);
@@ -395,6 +495,8 @@ struct RBM
       threads[thread]->join();
       delete threads[thread];
     }
+    threads.clear();
+    vrtx.clear();
   }
 
 };
@@ -416,23 +518,48 @@ struct DataUnit
     W = new float[v*h];
     b = new float[v];
     c = new float[h];
+    constant(c,0.5f,h);
+    constant(b,0.5f,v);
+    constant(W,0.5f,v*h);
       hidden = NULL;
      visible = NULL;
     visible0 = NULL;
   }
 
-  void train(float * dat, long n,long num_iters)
+  void train(float * dat, long n, long total_n,long num_iters,long batch_iter,int n_cd,float epsilon)
   {
-    rbm = new RBM(h,v,W,b,c,n,dat);
+    // RBM(long _v,long _h,float * _W,float * _b,float * _c,long _n,float * _X)
+    rbm = new RBM(v,h,W,b,c,n,dat);
     for(long i=0;i<num_iters;i++)
     {
-      rbm->cd(10,.0000001);
+      std::cout << "DataUnit::train i=" << i << std::endl;
+      long offset = (rand()%(total_n-n));
+      for(long k=0;k<batch_iter;k++)
+      {
+        rbm->init(offset);
+        std::cout << "prog:" << 100*(float)k/batch_iter << "%" << std::endl;
+        rbm->cd(n_cd,epsilon,offset*(10+3*WIN*WIN));
+      }
     }
   }
 
   void transform(float* X,float* Y)
   {
     rbm->vis2hid(X,Y);
+  }
+
+  void initialize_weights(DataUnit* d)
+  {
+    if(v==d->h&&h==d->v)
+    {
+      for(int i=0;i<v;i++)
+      {
+        for(int j=0;j<h;j++)
+        {
+          W[i*h+j] = d->W[j*d->h+i];
+        }
+      }
+    }
   }
 };
 
@@ -585,7 +712,7 @@ struct mRBM
   }
   mRBM()
   {
-
+    bottle_neck = NULL;
   }
   void copy(float * X,float * Y,long num)
   {
@@ -594,32 +721,40 @@ struct mRBM
       Y[i] = X[i];
     }
   }
-  void train(long in_num,long out_num,long n_samp,float * in,float * out)
+  void train(long in_num,long out_num,long n_samp,long total_n,long n_iter,long batch_iter,long n_cd,float epsilon,float * in,float * out)
   {
-    long n_iter = 100;
     float * X = NULL;
     float * Y = NULL;
     X = new float[in_num*n_samp];
+    for(long i=0;i<in_num*n_samp;i++)
+    {
+      X[i] = in[i];
+    }
     for(long i=0;i<input_branch.size();i++)
     {
-      //if(i>0)input_branch[i]->initialize_weights(input_branch[i-1]); // initialize weights to transpose of previous layer weights M_i -> W = M_{i-1} -> W ^ T
-      input_branch[i]->train(X,n_samp,n_iter);
+      if(i>0)input_branch[i]->initialize_weights(input_branch[i-1]); // initialize weights to transpose of previous layer weights M_i -> W = M_{i-1} -> W ^ T
+      input_branch[i]->train(X,n_samp,total_n,n_iter,batch_iter,n_cd,epsilon);
       Y = new float[input_branch[i]->h*n_samp];
       input_branch[i]->transform(X,Y);
       delete [] X;
       X = NULL;
+      std::cout << "X init:" << in_num*n_samp << "    " << "X fin:" << input_branch[i]->h*n_samp << std::endl;
       X = new float[input_branch[i]->h*n_samp];
-      copy(Y,X,output_branch[i]->h*n_samp);
+      copy(Y,X,input_branch[i]->h*n_samp);
       delete [] Y;
       Y = NULL;
     }
     delete [] X;
     X = NULL;
     X = new float[out_num*n_samp];
+    for(long i=0;i<out_num*n_samp;i++)
+    {
+      X[i] = out[i];
+    }
     for(long i=0;i<output_branch.size();i++)
     {
-      //if(i>0)output_branch[i]->initialize_weights(output_branch[i-1]); // initialize weights to transpose of previous layer weights M_i -> W = M_{i-1} -> W ^ T
-      output_branch[i]->train(X,n_samp,n_iter);
+      if(i>0)output_branch[i]->initialize_weights(output_branch[i-1]); // initialize weights to transpose of previous layer weights M_i -> W = M_{i-1} -> W ^ T
+      output_branch[i]->train(X,n_samp,total_n,n_iter,batch_iter,n_cd,epsilon);
       Y = new float[output_branch[i]->h*n_samp];
       output_branch[i]->transform(X,Y);
       delete [] X;
@@ -631,14 +766,19 @@ struct mRBM
     }
     delete [] X;
     X = NULL;
-    X = new float[(input_branch[input_branch.size()-1]->h + output_branch[output_branch.size()-1]->h)*n_samp];
-    bottle_neck->train(X,n_samp,n_iter);
-    delete [] X;
-    X = NULL;
+    if(bottle_neck!=NULL)
+    {
+      X = new float[(input_branch[input_branch.size()-1]->h + output_branch[output_branch.size()-1]->h)*n_samp];
+      bottle_neck->train(X,n_samp,total_n,n_iter,batch_iter,n_cd,epsilon);
+      delete [] X;
+      X = NULL;
+    }
   }
 };
 
 RBM * rbm = NULL;
+
+mRBM * mrbm = NULL;
 
 void drawBox(void)
 {
@@ -808,10 +948,94 @@ void run_rbm(long v,long h,long n,long total_n,float * dat)
     long offset = (rand()%(total_n-n));
     for(long k=0;k<batch_iter;k++)
     {
+      rbm->init(offset);
       std::cout << "prog:" << 100*(float)k/batch_iter << "%" << std::endl;
-      rbm->cd(n_cd,epsilon,offset*(10+3*WIN*WIN));
+      rbm->cd(n_cd,c_epsilon,offset*(10+3*WIN*WIN));
     }
   }
+}
+
+struct mrbm_params
+{
+
+  long batch_iter;
+  long num_batch;
+  long total_n;
+  long n;
+  float epsilon;
+  long n_iter;
+  long n_cd;
+
+  long v;
+  long h;
+
+  std::vector<long> input_sizes;
+
+  std::vector<long> output_sizes;
+
+  mrbm_params()
+  {
+
+    v  = 3*WIN*WIN+10;
+    h  = 3*WIN*WIN+10;
+
+    long h1 = 3*WIN*WIN+10;
+    long h2 = 3*WIN*WIN+10;
+    long h3 = 3*WIN*WIN+10;
+    long h4 = 3*WIN*WIN+10;
+    long h5 = 3*WIN*WIN+10;
+
+    n_cd = 1;
+    num_batch = n_batch;
+    batch_iter = 1;
+    n = n_samples;
+    total_n = n_samples;
+    epsilon = c_epsilon;
+    n_iter = 100;
+
+    input_sizes.push_back(v);
+    input_sizes.push_back(h1);
+    input_sizes.push_back(h2);
+    input_sizes.push_back(h3);
+    input_sizes.push_back(h4);
+    input_sizes.push_back(h5);
+
+    output_sizes.push_back(v);
+    output_sizes.push_back(h1);
+    output_sizes.push_back(h2);
+    output_sizes.push_back(h3);
+    output_sizes.push_back(h4);
+    output_sizes.push_back(h5);
+
+  }
+};
+
+void run_mrbm(mrbm_params p,float * dat_in,float * dat_out)
+{
+  mrbm = new mRBM();
+  //mrbm->construct(sizes,sizes,5);
+  for(long i=0;i+1<p.input_sizes.size();i++)
+  {
+    mrbm->input_branch.push_back(new DataUnit(p.input_sizes[i],p.input_sizes[i+1]));
+  }
+  for(long i=0;i+1<p.output_sizes.size();i++)
+  {
+    mrbm->output_branch.push_back(new DataUnit(p.output_sizes[i],p.output_sizes[i+1]));
+  }
+  //bottle_neck = new DataUnit(input_num[input_num.size()-1]+output_num[output_num.size()-1],bottle_neck_num);
+  mrbm->train(p.v,p.h,p.num_batch,p.total_n,p.n_iter,p.batch_iter,p.n_cd,p.epsilon,dat_in,dat_out);
+  //for(long i=0;;i++)
+  //{
+  //  std::cout << "i=" << i << std::endl;
+  //  long offset = (rand()%(total_n-n));
+  //  for(long k=0;k<batch_iter;k++)
+  //  {
+  //    rbm->init(offset);
+  //    std::cout << "prog:" << 100*(float)k/batch_iter << "%" << std::endl;
+  //    rbm->cd(n_cd,epsilon,offset*(10+3*WIN*WIN));
+  //  }
+  //}
+  std::cout << "training done..." << std::endl;
 }
 
 struct fault
@@ -930,151 +1154,29 @@ struct fault
   }
 };
 
-/*
-std::vector<long> indices;
-
-struct real_fault
-{
-  bool init;
-  long ox,oy,oz;
-  long nx,ny,nz;
-  void randomize()
-  {
-    init = true;
-    while(true)
-    {
-      long id = indices[rand()%indices.size()];
-      ox = (id/(n_z*n_y))%n_x-nx/2;
-      oy = (id/n_z)%n_y-ny/2;
-      oz = id%n_z-nz/2;
-      float max_arr = 0;
-      float val;
-      for(long i=0,x=ox+nx/4;x+nx/4<ox+nx;x++)
-      for(long y=oy+ny/4;y+ny/4<oy+ny;y++)
-      for(long z=oz+nz/4;z+nz/4<oz+nz;z++,i++)
-      {
-        val = fault_arr[z+n_z*(y+n_y*x)];
-        if(val>max_arr)max_arr=val;
-      }
-      std::cout << "max_arr=" << max_arr << std::endl;
-      if(max_arr>0.9){break;}
-    }
-  }
-  void generate_data(float * dat)
-  {
-    if(init)
-    {
-      long off = nx*ny*nz;
-      for(long i=0,z=oz;z<oz+nz;z++)
-      for(long y=oy;y<oy+ny;y++)
-      for(long x=ox;x<ox+nx;x++,i++)
-      {
-        dat[i    ] = seismic_arr[z+n_z*(y+n_y*x)];
-        dat[i+off] =   fault_arr[z+n_z*(y+n_y*x)];
-      }
-    }
-    else
-    {
-      std::cout << "fault not initialized" << std::endl;
-      exit(1);
-    }
-  }
-  real_fault(long _nx,long _ny,long _nz)
-  {
-    nx = _nx;
-    ny = _ny;
-    nz = _nz;
-    init = false;
-    randomize();
-  }
-};
-*/
-
-/*
-void faultGenerator2D(long wx,long wy,long n,float* dat)
-{
-  for(long k=0;k<n;k++)
-  {
-    // generate sample
-    fault f;
-    f.generate_data(wx,wy,&dat[k*2*wx*wy]);
-  }
-}
-*/
-
-/*
-void realFaultGenerator2D(long wx,long wy,long n,float * dat)
-{
-  std::cout << "real fault generator" << std::endl;
-	seismic_reader.read_sepval  ( &seismic_arr[0]
-		                          , seismic_reader.o1
-		                          , seismic_reader.o2
-		                          , seismic_reader.o3
-		                          , seismic_reader.n1
-		                          , seismic_reader.n2
-		                          , seismic_reader.n3
-		                          );
-  float max_seismic = 0;
-  for(long i=0,size=seismic_reader.n1*seismic_reader.n2*seismic_reader.n3;i<size;i++)
-  {
-    if(max_seismic<seismic_arr[i])max_seismic=seismic_arr[i];
-  }
-  for(long i=0,size=seismic_reader.n1*seismic_reader.n2*seismic_reader.n3;i<size;i++)
-  {
-    seismic_arr[i] /= 1e-5 + max_seismic;
-  }
-  std::cout << "seismic reader done" << std::endl;
-	  fault_reader.read_sepval  ( &  fault_arr[0]
-		                          , fault_reader.o1
-		                          , fault_reader.o2
-		                          , fault_reader.o3
-		                          , fault_reader.n1
-		                          , fault_reader.n2
-		                          , fault_reader.n3
-		                          );
-  float max_fault = 0;
-  float min_fault = 1;
-  for(long i=0,size=fault_reader.n1*fault_reader.n2*fault_reader.n3;i<size;i++)
-  {
-    if(max_fault<fault_arr[i])max_fault=fault_arr[i];
-    if(min_fault>fault_arr[i])min_fault=fault_arr[i];
-  }
-  std::cout << "max-fault:" << max_fault << std::endl;
-  std::cout << "min-fault:" << min_fault << std::endl;
-  std::cout << "fault reader done" << std::endl;
-  for(long k=0,x=0;x<n_x;x++)
-    for(long y=0;y<n_y;y++)
-      for(long z=0;z<n_z;z++,k++)
-      {
-        if(x>WIN)
-        if(y>WIN)
-        if(z>WIN)
-        if(x<n_x-WIN)
-        if(y<n_y-WIN)
-        if(z<n_z-WIN)
-        if(fault_arr[k]>0)
-          indices.push_back(k);
-      }
-  for(long k=0;k<n;k++)
-  {
-    // generate sample
-    real_fault f(wx,1,wy);
-    f.generate_data(&dat[k*2*wx*wy]);
-  }
-  std::cout << "generating data done" << std::endl;
-}
-*/
-
 void keyboard(unsigned char Key, int x, int y)
 {
   switch(Key)
   {
+    //case ' ':
+    //  {
+    //    long v = 3*WIN*WIN+10;
+    //    long h = 3*WIN*WIN+10;
+    //    long n = n_samples;
+    //    boost::thread * thr ( new boost::thread(run_rbm,v,h,n_batch,n,img_arr) );
+    //    break;
+    //  }
     case ' ':
       {
-        long v = 3*WIN*WIN+10;
-        long h = 3*WIN*WIN+10;
-        long n = n_samples;
-        boost::thread * thr ( new boost::thread(run_rbm,v,h,n_batch,n,img_arr) );
+
+        mrbm_params params;
+
+        boost::thread * thr ( new boost::thread ( run_mrbm
+                                                , params
+                                                , img_arr
+                                                , out_arr
+                                                ) 
+                            );
         break;
       }
     case 27:
@@ -1321,6 +1423,13 @@ int main(int argc,char ** argv)
   srand(time(0));
 
   std::vector<char> data;
+  //readBinary( "cifar-10-batches-bin/data_batch_1.bin", data );
+  //readBinary( "cifar-10-batches-bin/data_batch_2.bin", data );
+  //readBinary( "cifar-10-batches-bin/data_batch_3.bin", data );
+  //readBinary( "cifar-10-batches-bin/data_batch_4.bin", data );
+  //readBinary( "cifar-10-batches-bin/data_batch_5.bin", data );
+  //readBinary( "cifar-10-batches-bin/test_batch.bin", data );
+
   readBinary( "/home/antonk/cifar10/cifar10_data/cifar-10-batches-bin/data_batch_1.bin", data );
   readBinary( "/home/antonk/cifar10/cifar10_data/cifar-10-batches-bin/data_batch_2.bin", data );
   readBinary( "/home/antonk/cifar10/cifar10_data/cifar-10-batches-bin/data_batch_3.bin", data );
@@ -1341,7 +1450,7 @@ int main(int argc,char ** argv)
   //     vis_previewB[k] = (unsigned char)data[k+1+off2*(3*WIN*WIN+1)+2*(WIN*WIN)]/256.0;
   //  }
 
-  n_samples = 50;//data.size() / (3*WIN*WIN+1);
+  n_samples = 10;//data.size() / (3*WIN*WIN+1);
   n_batch = n_samples - 1;
 
   // visible = 3*WIN*WIN
@@ -1349,14 +1458,21 @@ int main(int argc,char ** argv)
   n_variables = ((3*WIN*WIN + 10));
 
   img_arr = new float[n_samples * n_variables];
+  out_arr = new float[n_samples * n_variables];
   orig_arr = new float[n_samples * n_variables];
 
   for(long s=0,k=0,t=0;s<n_samples;s++)
   {
     for(long i=0;i<3*WIN*WIN;i++,k++,t++)
-    img_arr[k] = (unsigned char)data[1+(3*WIN*WIN+1)*s+i]/256.0;
+    {
+      img_arr[k] = (unsigned char)data[1+(3*WIN*WIN+1)*s+i]/256.0;
+      out_arr[k] = (unsigned char)data[1+(3*WIN*WIN+1)*s+i]/256.0;
+    }
     for(long i=0;i<10;i++,k++)
-    img_arr[k] = (long)data[(3*WIN*WIN+1)*s]==k;
+    {
+      img_arr[k] = (long)data[(3*WIN*WIN+1)*s]==k;
+      out_arr[k] = (long)data[(3*WIN*WIN+1)*s]==k;
+    }
     t++;
   }
   for(int i=0;i<n_samples*n_variables;i++)
@@ -1365,6 +1481,7 @@ int main(int argc,char ** argv)
   for(long s=0;s<n_samples;s++)
   {
     semb_layer(WIN,WIN,&img_arr[(3*WIN*WIN+10)*s],&img_arr[(3*WIN*WIN+10)*s]);
+    semb_layer(WIN,WIN,&out_arr[(3*WIN*WIN+10)*s],&out_arr[(3*WIN*WIN+10)*s]);
   }
 
   std::cout << "done loading data ... " << std::endl;
