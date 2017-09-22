@@ -27,6 +27,8 @@
 //float * seismic_arr = new float[n_x*n_y*n_z];
 //float *   fault_arr = new float[n_x*n_y*n_z];
 
+long dat_offset = 0;
+
 long n_samples = 0;
 long n_batch = 0;
 long batch_iter = 200;
@@ -137,6 +139,7 @@ struct gradient_info
 void gradient_worker(gradient_info * g,std::vector<long> const & vrtx)
 {
   float factor = 1.0f / g->n;
+  float factorv= 1.0f / (g->v*g->v);
   for(long t=0;t<vrtx.size();t++)
   {
     long k = vrtx[t];
@@ -160,7 +163,7 @@ void gradient_worker(gradient_info * g,std::vector<long> const & vrtx)
 
     for(long i=0;i<g->v;i++)
     {
-      g->partial_err += (g->vis0[k*g->v+i]-g->vis[k*g->v+i])*(g->vis0[k*g->v+i]-g->vis[k*g->v+i]);
+      g->partial_err += factorv * (g->vis0[k*g->v+i]-g->vis[k*g->v+i])*(g->vis0[k*g->v+i]-g->vis[k*g->v+i]);
     }
   }
 }
@@ -289,7 +292,7 @@ struct RBM
     std::cout << "init timing:" << duration << '\n';
   }
 
-  void cd(long nGS,float epsilon,int offset=0)
+  void cd(long nGS,float epsilon,int offset=0,bool bottleneck=false)
   {
     boost::posix_time::ptime time_0(boost::posix_time::microsec_clock::local_time());
     std::cout << "cd" << std::endl;
@@ -315,8 +318,10 @@ struct RBM
       hid2vis(hid,vis);
       vis2hid(vis,hid);
 
-      long off = rand()%(n);
+      long off = dat_offset%(n);
       long offv = off*v;
+      long offh = off*h;
+      long off_preview = off*(3*WIN*WIN+10);
       for(long x=0,k=0;x<WIN;x++)
       {
         for(long y=0;y<WIN;y++,k++)
@@ -330,19 +335,18 @@ struct RBM
       {
         for(long y=0;y<WIN;y++,k++)
         {
-          vis1_preview[k] = orig_arr[offset+offv+k];
-          vis1_previewG[k] = orig_arr[offset+offv+k+WIN*WIN];
-          vis1_previewB[k] = orig_arr[offset+offv+k+2*WIN*WIN];
+          vis1_preview[k] = orig_arr[offset+off_preview+k];
+          vis1_previewG[k] = orig_arr[offset+off_preview+k+WIN*WIN];
+          vis1_previewB[k] = orig_arr[offset+off_preview+k+2*WIN*WIN];
         }
       }
-      long offh = off*h;
       for(long x=0,k=0;x<WIN;x++)
       {
         for(long y=0;y<WIN;y++,k++)
         {
-          vis0_preview[k] = vis0[offh+k];
-          vis0_previewG[k] = vis0[offh+k+WIN*WIN];
-          vis0_previewB[k] = vis0[offh+k+2*WIN*WIN];
+          vis0_preview[k] = vis0[offv+k];
+          vis0_previewG[k] = vis0[offv+k+WIN*WIN];
+          vis0_previewB[k] = vis0[offv+k+2*WIN*WIN];
         }
       }
 
@@ -511,8 +515,12 @@ struct DataUnit
   float * b;
   float * c;
   RBM * rbm;
-  DataUnit(long _v,long _h)
+  long num_iters;
+  long batch_iter;
+  DataUnit(long _v,long _h,long _num_iters = 100,long _batch_iter = 1)
   {
+    num_iters = _num_iters;
+    batch_iter = _batch_iter;
     v = _v;
     h = _h;
     W = new float[v*h];
@@ -526,7 +534,7 @@ struct DataUnit
     visible0 = NULL;
   }
 
-  void train(float * dat, long n, long total_n,long num_iters,long batch_iter,int n_cd,float epsilon)
+  void train(float * dat, long n, long total_n,int n_cd,float epsilon)
   {
     // RBM(long _v,long _h,float * _W,float * _b,float * _c,long _n,float * _X)
     rbm = new RBM(v,h,W,b,c,n,dat);
@@ -561,6 +569,32 @@ struct DataUnit
       }
     }
   }
+
+  void initialize_weights(DataUnit* d1,DataUnit* d2)
+  {
+    if(v==d1->h+d2->h&&d1->v==h&&d2->v==h)
+    {
+      std::cout << "initialize bottleneck" << std::endl;
+      char ch;
+      std::cin >> ch;
+      int j=0;
+      for(int k=0;j<d1->h;j++,k++)
+      {
+        for(int i=0;i<d1->v;i++)
+        {
+          W[i*h+j] = d1->W[k*d1->h+i];
+        }
+      }
+      for(int k=0;j<d1->h+d2->h;j++,k++)
+      {
+        for(int i=0;i<d2->v;i++)
+        {
+          W[i*h+j] = d2->W[k*d2->h+i];
+        }
+      }
+    }
+  }
+
 };
 
 struct CurveletTransform
@@ -721,11 +755,14 @@ struct mRBM
       Y[i] = X[i];
     }
   }
-  void train(long in_num,long out_num,long n_samp,long total_n,long n_iter,long batch_iter,long n_cd,float epsilon,float * in,float * out)
+  void train(long in_num,long out_num,long n_samp,long total_n,long n_cd,float epsilon,float * in,float * out)
   {
     float * X = NULL;
     float * Y = NULL;
+    float * IN = NULL;
+    float * OUT = NULL;
     X = new float[in_num*n_samp];
+    IN = new float[in_num*n_samp];
     for(long i=0;i<in_num*n_samp;i++)
     {
       X[i] = in[i];
@@ -733,7 +770,7 @@ struct mRBM
     for(long i=0;i<input_branch.size();i++)
     {
       if(i>0)input_branch[i]->initialize_weights(input_branch[i-1]); // initialize weights to transpose of previous layer weights M_i -> W = M_{i-1} -> W ^ T
-      input_branch[i]->train(X,n_samp,total_n,n_iter,batch_iter,n_cd,epsilon);
+      input_branch[i]->train(X,n_samp,total_n,n_cd,epsilon);
       Y = new float[input_branch[i]->h*n_samp];
       input_branch[i]->transform(X,Y);
       delete [] X;
@@ -741,12 +778,14 @@ struct mRBM
       std::cout << "X init:" << in_num*n_samp << "    " << "X fin:" << input_branch[i]->h*n_samp << std::endl;
       X = new float[input_branch[i]->h*n_samp];
       copy(Y,X,input_branch[i]->h*n_samp);
+      copy(Y,IN,input_branch[i]->h*n_samp);
       delete [] Y;
       Y = NULL;
     }
     delete [] X;
     X = NULL;
     X = new float[out_num*n_samp];
+    OUT = new float[in_num*n_samp];
     for(long i=0;i<out_num*n_samp;i++)
     {
       X[i] = out[i];
@@ -754,13 +793,14 @@ struct mRBM
     for(long i=0;i<output_branch.size();i++)
     {
       if(i>0)output_branch[i]->initialize_weights(output_branch[i-1]); // initialize weights to transpose of previous layer weights M_i -> W = M_{i-1} -> W ^ T
-      output_branch[i]->train(X,n_samp,total_n,n_iter,batch_iter,n_cd,epsilon);
+      output_branch[i]->train(X,n_samp,total_n,n_cd,epsilon);
       Y = new float[output_branch[i]->h*n_samp];
       output_branch[i]->transform(X,Y);
       delete [] X;
       X = NULL;
       X = new float[output_branch[i]->h*n_samp];
       copy(Y,X,output_branch[i]->h*n_samp);
+      copy(Y,OUT,output_branch[i]->h*n_samp);
       delete [] Y;
       Y = NULL;
     }
@@ -769,10 +809,27 @@ struct mRBM
     if(bottle_neck!=NULL)
     {
       X = new float[(input_branch[input_branch.size()-1]->h + output_branch[output_branch.size()-1]->h)*n_samp];
-      bottle_neck->train(X,n_samp,total_n,n_iter,batch_iter,n_cd,epsilon);
+      for(long s=0;s<n_samp;s++)
+      {
+        long i=0;
+        for(long k=0;i<in_num&&k<in_num;i++,k++)
+        {
+          X[s*(in_num+out_num)+i] = IN[s*in_num+k];
+        }
+        for(long k=0;i<in_num+out_num&&k<out_num;i++,k++)
+        {
+          X[s*(in_num+out_num)+i] = OUT[s*out_num+k];
+        }
+      }
+      //bottle_neck->initialize_weights(input_branch[input_branch.size()-1],output_branch[output_branch.size()-1]); // initialize weights to transpose of previous layer weights M_i -> W = M_{i-1} -> W ^ T
+      bottle_neck->train(X,n_samp,total_n,n_cd,epsilon);
       delete [] X;
       X = NULL;
     }
+    delete [] IN;
+    IN = NULL;
+    delete [] OUT;
+    OUT = NULL;
   }
 };
 
@@ -973,6 +1030,12 @@ struct mrbm_params
 
   std::vector<long> output_sizes;
 
+  std::vector<long> input_iters;
+
+  std::vector<long> output_iters;
+
+  long bottleneck_iters;
+
   mrbm_params()
   {
 
@@ -984,6 +1047,11 @@ struct mrbm_params
     long h3 = 3*WIN*WIN+10;
     long h4 = 3*WIN*WIN+10;
     long h5 = 3*WIN*WIN+10;
+    long h6 = 3*WIN*WIN+10;
+    long h7 = 3*WIN*WIN+10;
+    long h8 = 3*WIN*WIN+10;
+    long h9 = 3*WIN*WIN+10;
+    long h10= 3*WIN*WIN+10;
 
     n_cd = 1;
     num_batch = n_batch;
@@ -999,6 +1067,11 @@ struct mrbm_params
     input_sizes.push_back(h3);
     input_sizes.push_back(h4);
     input_sizes.push_back(h5);
+    input_sizes.push_back(h6);
+    input_sizes.push_back(h7);
+    input_sizes.push_back(h8);
+    input_sizes.push_back(h9);
+    input_sizes.push_back(h10);
 
     output_sizes.push_back(v);
     output_sizes.push_back(h1);
@@ -1006,6 +1079,35 @@ struct mrbm_params
     output_sizes.push_back(h3);
     output_sizes.push_back(h4);
     output_sizes.push_back(h5);
+    output_sizes.push_back(h6);
+    output_sizes.push_back(h7);
+    output_sizes.push_back(h8);
+    output_sizes.push_back(h9);
+    output_sizes.push_back(h10);
+
+    input_iters.push_back(100);
+    input_iters.push_back(20);
+    input_iters.push_back(20);
+    input_iters.push_back(20);
+    input_iters.push_back(20);
+    input_iters.push_back(20);
+    input_iters.push_back(20);
+    input_iters.push_back(20);
+    input_iters.push_back(20);
+    input_iters.push_back(20);
+
+    output_iters.push_back(100);
+    output_iters.push_back(20);
+    output_iters.push_back(20);
+    output_iters.push_back(20);
+    output_iters.push_back(20);
+    output_iters.push_back(20);
+    output_iters.push_back(20);
+    output_iters.push_back(20);
+    output_iters.push_back(20);
+    output_iters.push_back(20);
+
+    bottleneck_iters = 300;
 
   }
 };
@@ -1013,28 +1115,17 @@ struct mrbm_params
 void run_mrbm(mrbm_params p,float * dat_in,float * dat_out)
 {
   mrbm = new mRBM();
-  //mrbm->construct(sizes,sizes,5);
   for(long i=0;i+1<p.input_sizes.size();i++)
   {
-    mrbm->input_branch.push_back(new DataUnit(p.input_sizes[i],p.input_sizes[i+1]));
+    mrbm->input_branch.push_back(new DataUnit(p.input_sizes[i],p.input_sizes[i+1],p.input_iters[i]));
   }
   for(long i=0;i+1<p.output_sizes.size();i++)
   {
-    mrbm->output_branch.push_back(new DataUnit(p.output_sizes[i],p.output_sizes[i+1]));
+    mrbm->output_branch.push_back(new DataUnit(p.output_sizes[i],p.output_sizes[i+1],p.output_iters[i]));
   }
-  //bottle_neck = new DataUnit(input_num[input_num.size()-1]+output_num[output_num.size()-1],bottle_neck_num);
-  mrbm->train(p.v,p.h,p.num_batch,p.total_n,p.n_iter,p.batch_iter,p.n_cd,p.epsilon,dat_in,dat_out);
-  //for(long i=0;;i++)
-  //{
-  //  std::cout << "i=" << i << std::endl;
-  //  long offset = (rand()%(total_n-n));
-  //  for(long k=0;k<batch_iter;k++)
-  //  {
-  //    rbm->init(offset);
-  //    std::cout << "prog:" << 100*(float)k/batch_iter << "%" << std::endl;
-  //    rbm->cd(n_cd,epsilon,offset*(10+3*WIN*WIN));
-  //  }
-  //}
+  long bottle_neck_num = (p.input_sizes[p.input_sizes.size()-1]+p.output_sizes[p.output_sizes.size()-1]);
+  mrbm->bottle_neck = new DataUnit(p.input_sizes[p.input_sizes.size()-1]+p.output_sizes[p.output_sizes.size()-1],bottle_neck_num,p.bottleneck_iters);
+  mrbm->train(p.v,p.h,p.num_batch,p.total_n,p.n_cd,p.epsilon,dat_in,dat_out);
   std::cout << "training done..." << std::endl;
 }
 
@@ -1158,14 +1249,8 @@ void keyboard(unsigned char Key, int x, int y)
 {
   switch(Key)
   {
-    //case ' ':
-    //  {
-    //    long v = 3*WIN*WIN+10;
-    //    long h = 3*WIN*WIN+10;
-    //    long n = n_samples;
-    //    boost::thread * thr ( new boost::thread(run_rbm,v,h,n_batch,n,img_arr) );
-    //    break;
-    //  }
+    case 'w':dat_offset++;break;
+    case 's':dat_offset--;if(dat_offset<0)dat_offset=0;break;
     case ' ':
       {
 
@@ -1450,7 +1535,7 @@ int main(int argc,char ** argv)
   //     vis_previewB[k] = (unsigned char)data[k+1+off2*(3*WIN*WIN+1)+2*(WIN*WIN)]/256.0;
   //  }
 
-  n_samples = 10;//data.size() / (3*WIN*WIN+1);
+  n_samples = 4;//data.size() / (3*WIN*WIN+1);
   n_batch = n_samples - 1;
 
   // visible = 3*WIN*WIN
